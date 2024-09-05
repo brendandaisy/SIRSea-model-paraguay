@@ -6,7 +6,7 @@ library(cowplot)
 
 # estimate the date of each Saturday for the provide year and week labels
 add_target_date <- function(adm, date_pulled) {
-    date_end <- date_pulled - days(wday(date_pulled))
+    date_end <- date_pulled + days(7 - wday(date_pulled))
     num_dates <- distinct(adm, year, week) |> nrow()
     num_age_groups <- length(unique(adm$age_group))
     
@@ -39,33 +39,42 @@ post_array_quantiles <- function(post, var, age_dim=FALSE, q=c(0.025, 0.25, 0.75
         pivot_wider()
 }
 
-admits0 <- read_csv("mechanistic-model/raw-sari-admissions.csv")
+admits0 <- read_csv("mechanistic-model/target-sari-admissions.csv")
+# admits0 <- read_csv("mechanistic-model/raw-sari-admissions.csv")
 
-date_pulled <- ymd("2024-04-16") # most recent date when the data were updated
-
-admits <- admits0 |> 
-    filter(age_group != "Unknown") |> 
-    mutate(age_group=fct_relevel(age_group, "3-19", "20-59", after=1)) |> 
-    add_target_date(date_pulled) |> 
+admits <- admits0 |>
+    filter(age_group != "Unknown") |>
     filter(date < max(date)) |> # remove most recent week of data
     rename(epiweek=week)
+# admits <- admits0 |> 
+#     filter(age_group != "Unknown") |> 
+#     mutate(age_group=fct_relevel(age_group, "3-19", "20-59", after=1)) |> 
+#     add_target_date(date_pulled) |> 
+#     filter(date < max(date)) |> # remove most recent week of data
+#     rename(epiweek=week)
 
 # Choose a subset of more recent data for the mechanistic model-------------------
-admits_sub <- admits |> 
-    filter(date > "2021-09-01") |>
-    mutate(age_group=case_when(
-        age_group %in% c("20-59", "60+") ~ "adult",
-        TRUE ~ "pediatric"
-    )) |> 
-    group_by(date, year, epiweek, age_group) |>
-    summarize(inc_sari_hosp=sum(inc_sari_hosp), .groups="drop") |> 
+admits_sub <- admits |>
+    filter(date > "2021-09-01", age_group %in% c("Pediatric", "Adult")) |>
+    filter(epiweek != 53) |> # for now, since only one instance of it in the training data
     arrange(age_group, date)
+# admits_sub <- admits |> 
+#     filter(date > "2021-09-01") |>
+#     mutate(age_group=case_when(
+#         age_group %in% c("20-59", "60+") ~ "adult",
+#         TRUE ~ "pediatric"
+#     )) |> 
+#     group_by(date, year, epiweek, age_group) |>
+#     summarize(inc_sari_hosp=sum(inc_sari_hosp), .groups="drop") |> 
+#     arrange(age_group, date)
 
 # Prepare data for stan-----------------------------------------------------------
 ord_knots <- 3 # the "order" of the non-repeating transmission effect
-weeks_ahead <- 5 # forecast ahead weeks -1 through 3
+weeks_ahead <- 5 # forecast ahead weeks 0 through 4
 Tmax <- length(unique(admits_sub$date)) + weeks_ahead
-wk <- c(filter(admits_sub, age_group == "adult")$epiweek, 15:19) # TODO: fix this. Currently need to manually inspect `admits_sub`
+wk_obs <- filter(admits_sub, age_group == "Adult")$epiweek
+wk_pred <- last(wk_obs)+1:weeks_ahead
+wk <- c(wk_obs, ifelse(wk_pred > 52, wk_pred %% 53 + 1, wk_pred))
 knots <- rep(1:ceiling(Tmax/ord_knots), each=ord_knots)[1:Tmax] # indexes for non-repeating trans. effect
 
 # convert observed SARI to a matrix:
@@ -78,24 +87,19 @@ stan_dat <- list(
     N=c(1e6, 1e6), # let's just say a million people in each group at risk
     wk=wk,
     knots=knots,
-    y=ymat
+    y=ymat,
+    i_init=c(0.005, 0.005)
 )
 
 # Fit the stan model--------------------------------------------------------------
 init_params <- function() {
     list(
-        i_init=runif(2, 1e-5, 1e-3),
+        # i_init=runif(2, 1e-5, 1e-3),
         rho=runif(1, 0, 0.1),
         kappa=runif(1, 0, 0.1),
         alpha=runif(1, 0.7, 1),
-        phi=rnorm(53, -4, 0.5),
-        psi=matrix(rnorm(2*47, -4, 0.5), nrow=2)
-        # v0=runif(1, -9, -7),
-        # w0=runif(1, -9, -7),
-        # v1=0,
-        # w1=0
-        # v1=runif(1, -0.5, 0.5),
-        # w1=runif(1, -0.5, 0.5)
+        phi=rnorm(52, -4, 0.5),
+        psi=matrix(rnorm(2*50, -4, 0.5), nrow=2)
     )
 }
 
@@ -108,21 +112,39 @@ fit <- exec$sample(
     chains=8,
     parallel_chains=8,
     init=init_params,
-    iter_sampling=500,
-    iter_warmup=1000,
-    adapt_delta=0.95,
-    max_treedepth=15
+    iter_sampling=1250,
+    iter_warmup=9000,
+    adapt_delta=0.955,
+    max_treedepth=12
 )
 
 (fit_summ <- fit$summary())
 post <- as_draws_df(fit$draws())
 
-# inspect posteriors of epidemiological and hyper parameters
-mcmc_intervals(fit$draws(variables=c("alpha", "mu", "rho", "kappa", "sd_phi", "sd_psi", "v1", "w1")))
+# MCMC model diagnostics----------------------------------------------------------
+fit_nuts <- nuts_params(fit)
+fit_lp <- log_posterior(fit)
 
-last_date <- max(admits_sub$date)
+mcmc_trace(post, pars=c("lp__"), size=1.2, np=fit_nuts) +
+    scale_color_viridis_d()
+
+# mechanistic scalar parameters. none of these look problematic or very correlated, just
+# not very well constrained by the data
+mcmc_pairs(
+    post, pars=c("alpha", "mu", "rho", "kappa"), np=fit_nuts,
+    off_diag_args=list(size=0.75)
+)
+
+# transmission rate parameters appear most correlated with TODO??? whittle epi params down
+mcmc_pairs(
+    post, pars=c("alpha", "rho", "sd_phi", "sd_psi", "v1", "w1"), np=fit_nuts,
+    off_diag_args=list(size=0.75)
+)
+
+mcmc_nuts_divergence(fit_nuts, fit_lp)
 
 # Save the predicted quantiles----------------------------------------------------
+last_date <- max(admits_sub$date)
 quantiles_needed <- c(0.01, 0.025, seq(0.05, 0.95, by = 0.05), 0.975, 0.99)
 
 post_pred <- post |> 
@@ -130,7 +152,7 @@ post_pred <- post |>
     select(contains("yhat"), draw) |> 
     pivot_longer(-draw, values_to="pred_count") |> 
     mutate(
-        age_group=ifelse(str_extract(name, "\\d+(?=,)") == "1", "adult", "pediatric"), 
+        age_group=ifelse(str_extract(name, "\\d+(?=,)") == "1", "Adult", "Pediatric"), 
         t=as.integer(str_extract(name, "(?<=,)\\d+")),
         .keep="unused", .before=pred_count
     ) |> 
@@ -142,11 +164,12 @@ post_pred <- post |>
 pp_overall <- post_pred |> 
     group_by(draw, date) |> 
     summarise(pred_count=sum(pred_count), .groups="drop") |> 
-    mutate(age_group="overall")
+    mutate(age_group="Overall")
 
 post_pred_quants <- bind_rows(post_pred, pp_overall) |> 
     filter(date > last_date) |> 
-    group_by(age_group, date) |> 
+    mutate(horizon=as.numeric(as.factor(date)) - 1) |> 
+    group_by(age_group, date, horizon) |> 
     reframe(enframe(quantile(pred_count, quantiles_needed), "quant_level")) |> 
     arrange(date, age_group)
 
@@ -189,7 +212,7 @@ p2 <- post_pred_summ |>
 
 plot_grid(p1, p2, nrow=2)
 
-ggsave(paste0("mechanistic-model/submission-files/predictions", today(), ".pdf"), width=7, height=7)
+ggsave(paste0("mechanistic-model/submission-files/predictions", today(), ".pdf"), width=7, height=6)
 
 ### page 2
 
@@ -241,6 +264,26 @@ plot_grid(plot_grid(NULL, p1, NULL, rel_widths=c(1, 3, 1), nrow=1), p2, p3, nrow
 
 ggsave(paste0("mechanistic-model/submission-files/latent-effects", today(), ".pdf"), width=6, height=8)
 
+
+###Another one
+tmp <- post |> 
+    subset_draws(variable=c("C", "I")) |> 
+    mutate(draw=.draw) |> 
+    pivot_longer(-draw) |> 
+    mutate(
+        age_group=ifelse(str_extract(name, "\\d+(?=,)") == "1", "Adult", "Pediatric"), 
+        t=as.integer(str_extract(name, "(?<=,)\\d+"))
+    ) |> 
+    filter(t > 1) |> 
+    mutate(
+        name=str_extract(name, "\\w"),
+        t=ifelse(name == "I", t+1, t)
+    )
+
+tmp |> 
+    pivot_wider() |> 
+    mutate(deltaI=C-)
+    
 
 
 
