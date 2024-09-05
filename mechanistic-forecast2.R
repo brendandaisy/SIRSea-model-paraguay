@@ -212,6 +212,7 @@ p2 <- post_pred_summ |>
 
 plot_grid(p1, p2, nrow=2)
 
+# Maya, you may need to change the file paths btw
 ggsave(paste0("mechanistic-model/submission-files/predictions-", today(), ".pdf"), width=6.8, height=5.6)
 
 # Save the predicted quantiles----------------------------------------------------
@@ -234,7 +235,8 @@ fname <- paste0("UGA_flucast-SIRSea/", forecast_date, "-UGA_flucast-SIRSea.csv")
 write_csv(post_pred_quants, paste0("/Users/brendaisy/Documents/Projects/Paraguay Forecasting/NCIRD-GIB-Paraguay-Forecasting/model-output/", fname))
 check_format(fname)
 
-### page 2
+#  Posterior of the time-varying/latent parameters and effective------------------
+#  reproductive number------------------------------------------------------------
 post_beta_summ <- post_array_quantiles(post, "beta", age_dim=TRUE) |> 
     mutate(across(mean:`97.5%`, ~.x*1e6)) |> 
     left_join(distinct(post_pred, t, age_group, date))
